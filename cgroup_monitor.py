@@ -4,10 +4,13 @@ import sys
 import os
 import argparse
 import time
+import signal
 from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.ticker import FuncFormatter
+
+from execute_inside_cgroup import main as stress_test_main
 
 # Add project root to Python path to allow importing vmlinux
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -253,6 +256,38 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"❌ Error getting cgroup ID: {e}")
             sys.exit(1)
+
+    def run_function_in_cgroup(cgroup_path: Path, func) -> int:
+        """Fork and run a function inside the specified cgroup.
+        
+        Returns the child process PID to the parent process.
+        """
+        cgroup_procs = cgroup_path / "cgroup.procs"
+        
+        pid = os.fork()
+        
+        if pid == 0:
+            # Child process - move self into cgroup, then run the function
+            try:
+                # Move this process into the cgroup
+                with open(cgroup_procs, 'w') as f:
+                    f.write(str(os.getpid()))
+                print(f"✅ Child process {os.getpid()} moved into cgroup")
+                
+                # Now run the function inside the cgroup
+                func()
+                
+            except PermissionError:
+                print(f"❌ Permission denied: Cannot write to {cgroup_procs}")
+                print("   Run with sudo to execute processes inside cgroups")
+            except Exception as e:
+                print(f"❌ Child process error: {e}")
+            finally:
+                os._exit(0)  # Exit child process
+        else:
+            # Parent process - return child PID for tracking
+            print(f"✅ Started stress test process (PID: {pid}) inside cgroup '{cgroup_path.name}'")
+            return pid
 
     # ==================== Cgroup Stats Reading Functions ====================
 
@@ -558,6 +593,10 @@ if __name__ == "__main__":
     cgroup_id = get_cgroup_id(cgroup_path)
     print(f"✅ Cgroup ID: {cgroup_id}")
 
+    # Start stress test inside the cgroup
+    print("🚀 Starting stress test inside cgroup...")
+    child_pid = run_function_in_cgroup(cgroup_path, stress_test_main)
+
     print("🔥 Loading BPF programs...")
 
     # Load and attach BPF program
@@ -607,3 +646,14 @@ if __name__ == "__main__":
     # Show the plot
     plt.show()
 
+    # Cleanup: terminate child process when graph window closes
+    print("\n🛑 Cleaning up...")
+    if child_pid:
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+            os.waitpid(child_pid, 0)
+            print(f"✅ Child process {child_pid} terminated")
+        except ProcessLookupError:
+            print(f"✅ Child process {child_pid} already exited")
+        except Exception as e:
+            print(f"⚠️ Error terminating child process: {e}")
